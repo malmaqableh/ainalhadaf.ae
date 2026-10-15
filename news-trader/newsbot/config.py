@@ -38,9 +38,12 @@ class AnalysisConfig:
 
 @dataclass
 class ScoringConfig:
+    # weighted confidence = model confidence
+    #                       x (0.5 + 0.5 x best publisher reliability)
+    #                       x confirmation weight for the number of independent sources
     default_reliability: float = 0.5   # publishers not listed in sources.yaml
-    # weight by number of independent sources: [1 source, 2 sources, 3+ sources]
-    confirmation_weights: list[float] = field(default_factory=lambda: [0.85, 0.925, 1.0])
+    # [1 source, 2 sources, 3+ sources]
+    confirmation_weights: list[float] = field(default_factory=lambda: [0.85, 0.95, 1.0])
 
 
 @dataclass

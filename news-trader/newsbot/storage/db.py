@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text,
                         TypeDecorator, create_engine, event, select)
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -165,7 +166,9 @@ class Database:
         if url.startswith("sqlite:///") and url != "sqlite:///:memory:":
             from pathlib import Path
             Path(url.removeprefix("sqlite:///")).parent.mkdir(parents=True, exist_ok=True)
-        kwargs = {"connect_args": {"check_same_thread": False}} if url.startswith("sqlite") else {}
+        kwargs: dict = {"connect_args": {"check_same_thread": False}} if url.startswith("sqlite") else {}
+        if url == "sqlite:///:memory:":
+            kwargs["poolclass"] = StaticPool  # one shared in-memory database (tests, backtests)
         self.engine = create_engine(url, future=True, **kwargs)
         if url.startswith("sqlite"):
             @event.listens_for(self.engine, "connect")

@@ -24,8 +24,10 @@ analysis:
   prefilter: true         # only send stories mentioning a tracked asset or macro keyword
 
 scoring:
+  # weighted confidence = model confidence x (0.5 + 0.5 x best publisher reliability)
+  #                       x confirmation weight for the number of independent sources
   default_reliability: 0.5          # publishers not listed in sources.yaml
-  confirmation_weights: [0.85, 0.925, 1.0]   # 1 source, 2 sources, 3+ sources
+  confirmation_weights: [0.85, 0.95, 1.0]    # 1 source, 2 sources, 3+ sources
 
 signals:
   min_confidence: 0.75              # weighted confidence needed to trade
