@@ -31,6 +31,9 @@ class RiskConfig:
     take_profit_pct: float = 0.06     # 0 disables take-profit
     max_daily_loss_pct: float = 0.03  # no new entries for the rest of the UTC day
     max_drawdown_pct: float = 0.15    # kill switch: close everything and halt
+    exchange_stop_loss: bool = True   # testnet/live: keep a real stop order on the exchange
+    stop_order_type: str = "limit"    # "limit" (needed on Binance spot) or "market"
+    stop_limit_offset_pct: float = 0.01  # stop-limit: limit price this far below the trigger
 
 
 @dataclass
@@ -73,6 +76,10 @@ class Config:
                 raise ConfigError(f"risk.{name} must be between 0 and 1, got {value}")
         if not (0 <= r.take_profit_pct < 10):
             raise ConfigError("risk.take_profit_pct must be >= 0")
+        if r.stop_order_type not in ("limit", "market"):
+            raise ConfigError("risk.stop_order_type must be 'limit' or 'market'")
+        if not (0 <= r.stop_limit_offset_pct < 0.2):
+            raise ConfigError("risk.stop_limit_offset_pct must be between 0 and 0.2")
         if r.starting_cash <= 0:
             raise ConfigError("risk.starting_cash must be positive")
         c = self.costs

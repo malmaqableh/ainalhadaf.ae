@@ -5,7 +5,8 @@ An autonomous crypto trading bot. Once started, it runs on its own, 24/7:
 1. Every `poll_seconds` it checks the price.
 2. When a candle closes, it asks the strategy: **buy**, **sell**, or **hold**.
 3. It sizes the trade from your risk settings and places the order.
-4. It watches the stop-loss and take-profit of the open position.
+4. It protects every position with a stop-loss. In testnet/live mode this is a real
+   order resting on the exchange, so it works even when the bot is offline.
 5. It enforces a daily loss limit and a max-drawdown kill switch.
 6. It saves its state to disk, so it picks up where it left off after a restart.
 
@@ -81,12 +82,37 @@ The bot refuses to start in live mode without `BOT_CONFIRM_LIVE=YES`.
 
 | What | How |
 |---|---|
-| Stop now | `Ctrl+C`, or create the kill file: `touch STOP` (delete it to allow restart). Stopping does **not** sell an open position. |
+| Stop now | `Ctrl+C`, or create the kill file: `touch STOP` (delete it to allow restart). Stopping does **not** sell an open position; in testnet/live its exchange stop-loss stays active. |
 | Daily loss limit | Down `max_daily_loss_pct` since the start of the UTC day: no new trades until tomorrow. |
 | Kill switch | Down `max_drawdown_pct` from the peak: sells everything and **halts**. It stays halted, even after a restart, until you run `python -m bot resume`. |
 | Errors | Network errors are logged and retried with backoff, so stops keep being watched. Wrong API keys stop the bot. |
 
 Logs: `logs/bot.log`. State: `state/bot_state.json`.
+
+## Exchange-side stop-loss (testnet/live)
+
+Right after each buy, the bot places a **stop-loss sell order on the exchange**
+(`risk.exchange_stop_loss: true`). The exchange then protects the position even if
+the bot, the server or the internet goes down.
+
+- **Stop-limit by default.** Binance spot does not accept stop-market orders, so the
+  order is a stop-limit: it triggers at the stop price and sells no lower than
+  `stop_limit_offset_pct` below it. In a very fast crash the price can jump past the
+  limit and the order won't fill. The bot keeps watching the price too, and in that
+  case cancels the order and sells at market. If your exchange supports stop-market
+  orders, `stop_order_type: market` avoids this.
+- **Before any other sell** (sell signal, take-profit, kill switch), the bot cancels
+  the stop order first, because the order locks the coins. If the stop already filled,
+  the bot records that and does not sell again.
+- **Fills while offline are picked up.** On the next start, the bot sees that the stop
+  filled and records the trade.
+- **If the order is cancelled outside the bot** (for example in the exchange app), the
+  bot places a new one on its next check.
+- **If the exchange doesn't support stop-loss orders,** the bot logs an error and falls
+  back to watching the stop itself.
+
+Take-profit is still watched by the bot, not placed on the exchange. Missing it while
+offline means a missed gain, not a bigger loss.
 
 ## Running it 24/7
 
@@ -113,9 +139,12 @@ Then: `sudo systemctl enable --now trading-bot` and `journalctl -u trading-bot -
 
 ## Known limitations
 
-- **Stop-loss is watched by the bot, not placed on the exchange.** If the bot or
-  server is down, the stop isn't enforced. Placing exchange-side stop orders is a
-  planned improvement before trading meaningful size.
+- Exchange-side stop orders were built against ccxt's unified API and Binance's
+  order rules, and are tested against a simulated exchange only. Other exchanges
+  (Bybit, OKX…) may handle trigger orders differently. Test on **testnet** first.
+- In paper mode the stop-loss is watched by the bot (there is no exchange order).
+- Fees on stop-loss fills may not be reported by the exchange's order data, so P&L
+  for those trades can leave out the fee.
 - Spot, long-only, one symbol at a time. No leverage or shorting.
 - Fees paid in a third currency (for example BNB) aren't counted in P&L.
 - Backtests use candle data, so the exact order of prices inside a candle is unknown.

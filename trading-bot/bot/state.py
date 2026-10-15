@@ -16,6 +16,7 @@ class Position:
     stop_price: float
     take_profit_price: float | None
     opened_at: str
+    stop_order_id: str | None = None  # stop-loss order resting on the exchange (testnet/live)
 
 
 @dataclass

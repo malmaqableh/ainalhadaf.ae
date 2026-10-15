@@ -42,6 +42,8 @@ class ExchangeBroker:
 class PaperBroker(ExchangeBroker):
     """Real market prices, simulated money. The account lives in BotState."""
 
+    supports_stop_orders = False
+
     def __init__(self, exchange, symbol: str, timeframe: str, costs: CostConfig, state: BotState):
         super().__init__(exchange, symbol, timeframe)
         self.costs = costs
@@ -70,8 +72,13 @@ class PaperBroker(ExchangeBroker):
 class LiveBroker(ExchangeBroker):
     """Real orders on the exchange (or its testnet). The exchange balance is the source of truth."""
 
-    def __init__(self, exchange, symbol: str, timeframe: str):
+    supports_stop_orders = True
+
+    def __init__(self, exchange, symbol: str, timeframe: str,
+                 stop_order_type: str = "limit", stop_limit_offset_pct: float = 0.01):
         super().__init__(exchange, symbol, timeframe)
+        self.stop_order_type = stop_order_type
+        self.stop_limit_offset_pct = stop_limit_offset_pct
         exchange.load_markets()
         self.market = exchange.market(symbol)
         self.base = self.market["base"]
@@ -141,6 +148,49 @@ class LiveBroker(ExchangeBroker):
         order = self.exchange.create_order(self.symbol, "market", "sell", amount)
         return self._to_fill("sell", self._settle(order), ref_price)
 
+    # ---- exchange-side stop-loss ---------------------------------------
+    # Order status helpers return (status, fill): status is "open", "closed" (fully
+    # filled) or "canceled"; fill covers whatever part of the order executed.
+
+    def place_stop(self, qty: float, stop_price: float) -> str | None:
+        """Rest a sell stop-loss order on the exchange; returns its order id."""
+        trigger = float(self.exchange.price_to_precision(self.symbol, stop_price))
+        limit = None
+        if self.stop_order_type == "limit":
+            limit = float(self.exchange.price_to_precision(
+                self.symbol, stop_price * (1 - self.stop_limit_offset_pct)))
+        free_base = float(self._balances().get("free", {}).get(self.base) or 0)
+        amount = self._tradeable_amount(min(qty, free_base), limit or trigger)
+        if amount is None:
+            return None
+        order = self.exchange.create_stop_loss_order(
+            self.symbol, self.stop_order_type, "sell", amount, limit, trigger)
+        return str(order["id"])
+
+    def stop_order_status(self, order_id: str) -> tuple[str, Fill | None]:
+        try:
+            order = self.exchange.fetch_order(order_id, self.symbol)
+        except ccxt.OrderNotFound:
+            log.warning("stop order %s not found on the exchange", order_id)
+            return "canceled", None
+        status = order.get("status")
+        if status == "open":
+            return "open", None
+        fill = None
+        if float(order.get("filled") or 0) > 0:
+            fill = self._to_fill("sell", order, float(order.get("price") or 0))
+        return ("closed" if status == "closed" else "canceled"), fill
+
+    def cancel_stop(self, order_id: str) -> tuple[str, Fill | None]:
+        try:
+            self.exchange.cancel_order(order_id, self.symbol)
+        except ccxt.OrderNotFound:
+            pass  # already filled or removed; the status below says which
+        status, fill = self.stop_order_status(order_id)
+        if status == "open":
+            raise RuntimeError(f"stop order {order_id} is still open after cancelling")
+        return status, fill
+
 
 def make_exchange(cfg: Config, authenticated: bool):
     cls = getattr(ccxt, cfg.exchange, None)
@@ -167,4 +217,5 @@ def make_broker(cfg: Config, state: BotState):
         raise LiveTradingNotConfirmed(
             "mode is 'live' but BOT_CONFIRM_LIVE=YES is not set. Real money is at risk; "
             "set it only after backtesting and paper/testnet trading.")
-    return LiveBroker(make_exchange(cfg, authenticated=True), cfg.symbol, cfg.timeframe)
+    return LiveBroker(make_exchange(cfg, authenticated=True), cfg.symbol, cfg.timeframe,
+                      cfg.risk.stop_order_type, cfg.risk.stop_limit_offset_pct)

@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import ccxt
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 HOUR_MS = 3_600_000
@@ -33,3 +35,79 @@ class FakeExchange:
 
     def fetch_ticker(self, symbol):
         return {"last": self.price}
+
+
+class FakeLiveExchange(FakeExchange):
+    """An authenticated exchange: real-looking balances, market orders and stop orders.
+    Open stop orders lock their coins, like on a real exchange."""
+
+    def __init__(self, candles, price=None, quote=1000.0):
+        super().__init__(candles, price)
+        self.balance = {"USDT": quote, "BTC": 0.0}
+        self.orders = {}
+        self.calls = []
+        self.stop_error = None
+        self._next_id = 0
+
+    def _id(self):
+        self._next_id += 1
+        return str(self._next_id)
+
+    def load_markets(self):
+        return {}
+
+    def market(self, symbol):
+        return {"base": "BTC", "quote": "USDT",
+                "limits": {"amount": {"min": 0.0001}, "cost": {"min": 5}}}
+
+    def amount_to_precision(self, symbol, amount):
+        return f"{int(amount * 1e6) / 1e6:.6f}"
+
+    def price_to_precision(self, symbol, price):
+        return f"{price:.2f}"
+
+    def fetch_balance(self):
+        locked = sum(o["amount"] - o["filled"] for o in self.orders.values() if o["status"] == "open")
+        return {"free": {"USDT": self.balance["USDT"], "BTC": self.balance["BTC"] - locked},
+                "total": dict(self.balance)}
+
+    def create_order(self, symbol, type, side, amount, price=None, params=None):
+        self.calls.append(("market", side, amount))
+        if side == "sell" and amount > self.fetch_balance()["free"]["BTC"] + 1e-12:
+            raise RuntimeError("insufficient balance (coins locked by an open order?)")
+        sign = 1 if side == "buy" else -1
+        self.balance["BTC"] += sign * amount
+        self.balance["USDT"] -= sign * amount * self.price
+        return {"id": self._id(), "status": "closed", "filled": amount, "average": self.price}
+
+    def create_stop_loss_order(self, symbol, type, side, amount, price=None, stopLossPrice=None, params=None):
+        if self.stop_error:
+            raise self.stop_error
+        oid = self._id()
+        self.orders[oid] = {"id": oid, "type": type, "amount": amount, "price": price,
+                            "trigger": stopLossPrice, "status": "open", "filled": 0.0, "average": None}
+        self.calls.append(("stop", type, amount, price, stopLossPrice))
+        return dict(self.orders[oid])
+
+    def fill_stop(self, oid, qty=None):
+        """Simulate the exchange executing (part of) a stop order."""
+        o = self.orders[oid]
+        qty = qty or o["amount"]
+        o["filled"] = qty
+        o["average"] = o["price"] or o["trigger"]
+        if qty >= o["amount"]:
+            o["status"] = "closed"
+        self.balance["BTC"] -= qty
+        self.balance["USDT"] += qty * o["average"]
+
+    def fetch_order(self, oid, symbol):
+        if oid not in self.orders:
+            raise ccxt.OrderNotFound(oid)
+        return dict(self.orders[oid])
+
+    def cancel_order(self, oid, symbol):
+        o = self.orders.get(oid)
+        if not o or o["status"] != "open":
+            raise ccxt.OrderNotFound(oid)
+        o["status"] = "canceled"
+        self.calls.append(("cancel", oid))

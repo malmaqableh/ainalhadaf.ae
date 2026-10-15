@@ -37,17 +37,23 @@ class Engine:
         self.clock = clock
         self.sleep = sleep
         self.timeframe_ms = ccxt.Exchange.parse_timeframe(cfg.timeframe) * 1000
+        self.exchange_stops = cfg.risk.exchange_stop_loss and getattr(broker, "supports_stop_orders", False)
 
     # ---- one iteration -------------------------------------------------
 
     def step(self) -> bool:
         """Run one check of the market. Returns False when the bot must stop."""
         if Path(self.cfg.kill_file).exists():
-            log.warning("kill file %s found; stopping (open positions are left as they are)", self.cfg.kill_file)
+            pos = self.state.position
+            log.warning("kill file %s found; stopping. Open position is left as is%s", self.cfg.kill_file,
+                        " (its exchange stop-loss stays active)" if pos and pos.stop_order_id
+                        else "" if not pos else " and its stop-loss is NOT watched")
             return False
         if self.state.halted:
             log.error("bot is halted: %s. Run `python -m bot resume` after reviewing.", self.state.halt_reason)
             return False
+
+        self._sync_exchange_stop()
 
         now = self.clock()
         now_ms = int(now.timestamp() * 1000)
@@ -94,6 +100,7 @@ class Engine:
                 else:
                     self._enter(price, equity)
 
+        self._protect(price)
         self.store.save(self.state)
         return True
 
@@ -115,22 +122,87 @@ class Engine:
         log.info("BUY %.8f %s @ %.2f (fee %.4f) stop=%.2f",
                  fill.qty, self.cfg.symbol, fill.price, fill.fee, self.state.position.stop_price)
         self.store.save(self.state)
+        self._protect(price)
 
     def _exit(self, price: float, reason: str) -> None:
         pos = self.state.position
+        if pos.stop_order_id:
+            # Cancel first: the stop order locks the coins, and it may have filled already.
+            status, fill = self.broker.cancel_stop(pos.stop_order_id)
+            pos.stop_order_id = None
+            if fill:
+                self._record_exit(fill, "stop-loss (exchange)", closes=status == "closed")
+            self.store.save(self.state)
+            pos = self.state.position
+            if not pos:
+                return
         fill = self.broker.sell(pos.qty, price)
         if not fill:
             log.error("could not close position (%s); will retry next check", reason)
             return
-        pnl = fill.qty * fill.price - fill.fee - (fill.qty * pos.entry_price + pos.entry_fee)
+        self._record_exit(fill, reason, closes=True)
+
+    def _record_exit(self, fill, reason: str, closes: bool) -> None:
+        """Book a (possibly partial) sell against the open position."""
+        pos = self.state.position
+        share = min(fill.qty / pos.qty, 1.0) if pos.qty > 0 else 1.0
+        entry_fee = pos.entry_fee * share
+        pnl = fill.qty * fill.price - fill.fee - (fill.qty * pos.entry_price + entry_fee)
         self.state.trades.append({
             "symbol": self.cfg.symbol, "qty": fill.qty,
             "entry_price": pos.entry_price, "exit_price": fill.price,
             "opened_at": pos.opened_at, "closed_at": self.clock().isoformat(),
             "pnl": round(pnl, 8), "reason": reason})
-        self.state.position = None
-        log.info("SELL %.8f %s @ %.2f (%s) pnl=%.2f", fill.qty, self.cfg.symbol, fill.price, reason, pnl)
+        if closes or fill.qty >= pos.qty:
+            self.state.position = None
+        else:
+            pos.qty -= fill.qty
+            pos.entry_fee -= entry_fee
+        log.info("SELL %.8f %s @ %.2f (%s) pnl=%.2f%s", fill.qty, self.cfg.symbol, fill.price, reason, pnl,
+                 "" if self.state.position is None else f"; {pos.qty:.8f} still held")
         self.store.save(self.state)
+
+    # ---- exchange-side stop-loss ---------------------------------------
+
+    def _sync_exchange_stop(self) -> None:
+        """Pick up a stop-loss that filled on the exchange (also while the bot was offline)."""
+        pos = self.state.position
+        if not pos or not pos.stop_order_id or not getattr(self.broker, "supports_stop_orders", False):
+            return
+        status, fill = self.broker.stop_order_status(pos.stop_order_id)
+        if status == "open":
+            return
+        pos.stop_order_id = None
+        if fill:
+            self._record_exit(fill, "stop-loss (exchange)", closes=status == "closed")
+        if self.state.position:
+            log.warning("exchange stop-loss order ended as %s; placing a new one", status)
+        self.store.save(self.state)
+
+    def _protect(self, price: float) -> None:
+        """Make sure an open position has a stop-loss order resting on the exchange."""
+        pos = self.state.position
+        if not pos or pos.stop_order_id or not self.exchange_stops:
+            return
+        if price <= pos.stop_price:
+            return  # already through the stop: the bot's own check sells instead
+        try:
+            order_id = self.broker.place_stop(pos.qty, pos.stop_price)
+        except ccxt.NotSupported as e:
+            log.error("%s does not support stop-loss orders (%s); the bot will watch the stop itself",
+                      self.cfg.exchange, e)
+            self.exchange_stops = False
+            return
+        except ccxt.AuthenticationError:
+            raise
+        except Exception as e:
+            log.error("could not place exchange stop-loss (%s); retrying next check, "
+                      "the bot is watching the stop meanwhile", e)
+            return
+        if order_id:
+            pos.stop_order_id = order_id
+            log.info("exchange stop-loss placed: order %s, trigger %.2f", order_id, pos.stop_price)
+            self.store.save(self.state)
 
     # ---- forever loop --------------------------------------------------
 

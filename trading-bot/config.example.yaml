@@ -23,6 +23,11 @@ risk:
   take_profit_pct: 0.06      # exit if price rises 6% above entry (0 = off)
   max_daily_loss_pct: 0.03   # down 3% today -> no new trades until tomorrow (UTC)
   max_drawdown_pct: 0.15     # down 15% from peak -> sell everything and HALT
+  # testnet/live: keep a real stop-loss order on the exchange, so the position
+  # stays protected even if the bot or server goes down.
+  exchange_stop_loss: true
+  stop_order_type: limit     # limit = stop-limit (Binance spot needs this) | market
+  stop_limit_offset_pct: 0.01  # stop-limit sells no lower than 1% below the trigger
 
 costs:
   fee_rate: 0.001            # 0.1% per trade; check your exchange's fee tier
