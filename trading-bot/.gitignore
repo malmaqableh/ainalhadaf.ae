@@ -1,9 +1,0 @@
-config.yaml
-.env
-state/
-logs/
-data/
-STOP
-__pycache__/
-.pytest_cache/
-.venv/

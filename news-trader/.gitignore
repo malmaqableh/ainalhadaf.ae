@@ -1,7 +1,0 @@
-.env
-config/settings.yaml
-data/
-logs/
-__pycache__/
-.pytest_cache/
-.venv/
