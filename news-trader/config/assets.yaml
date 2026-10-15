@@ -1,0 +1,28 @@
+# Tradable assets. "aliases" are names/tickers the analyzer may return for the asset;
+# "keywords" mark a story as relevant (used by the prefilter and the keyword analyzer).
+assets:
+  - symbol: BTC/USDT
+    asset_class: crypto
+    aliases: [BTC, XBT, BITCOIN]
+    keywords: [bitcoin, btc, spot bitcoin etf, crypto, cryptocurrency, digital asset]
+  - symbol: ETH/USDT
+    asset_class: crypto
+    aliases: [ETH, ETHER, ETHEREUM]
+    keywords: [ethereum, ether, eth]
+  - symbol: SOL/USDT
+    asset_class: crypto
+    aliases: [SOL, SOLANA]
+    keywords: [solana]
+  - symbol: XRP/USDT
+    asset_class: crypto
+    aliases: [XRP, RIPPLE]
+    keywords: [xrp, ripple]
+  - symbol: BNB/USDT
+    asset_class: crypto
+    aliases: [BNB]
+    keywords: [bnb, binance]
+
+# Macro news that can move every asset (rates, inflation, regulation, conflict).
+macro_keywords: [federal reserve, fed, interest rate, rate cut, rate hike, inflation, cpi,
+                 jobs report, payrolls, recession, sec, regulation, ban, tariff, sanctions,
+                 war, ceasefire, etf, stablecoin, hack, exploit, bankruptcy]

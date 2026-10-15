@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Test Feed</title>
+<item><title>Bitcoin surges past $70,000 as ETF inflows jump</title>
+<link>https://www.example-news.com/markets/bitcoin-70k?utm_source=rss&amp;id=7</link>
+<pubDate>Mon, 02 Mar 2026 13:55:00 GMT</pubDate>
+<description>&lt;p&gt;Bitcoin &lt;b&gt;rallied&lt;/b&gt; on Monday.&lt;/p&gt;</description></item>
+<item><title>Old story</title><link>https://www.example-news.com/old</link>
+<pubDate>Mon, 02 Mar 2026 08:00:00 GMT</pubDate></item>
+<item><title>Story without a date</title><link>https://www.example-news.com/nodate</link></item>
+</channel></rss>
