@@ -28,6 +28,9 @@ risk:
   exchange_stop_loss: true
   stop_order_type: limit     # limit = stop-limit (Binance spot needs this) | market
   stop_limit_offset_pct: 0.01  # stop-limit sells no lower than 1% below the trigger
+  # Binance spot: also put the take-profit on the exchange, combined with the
+  # stop-loss in one OCO order (when one fills, the exchange cancels the other).
+  exchange_take_profit: true
 
 costs:
   fee_rate: 0.001            # 0.1% per trade; check your exchange's fee tier

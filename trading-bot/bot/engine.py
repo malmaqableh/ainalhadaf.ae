@@ -38,6 +38,7 @@ class Engine:
         self.sleep = sleep
         self.timeframe_ms = ccxt.Exchange.parse_timeframe(cfg.timeframe) * 1000
         self.exchange_stops = cfg.risk.exchange_stop_loss and getattr(broker, "supports_stop_orders", False)
+        self.exchange_take_profits = self.exchange_stops and cfg.risk.exchange_take_profit
 
     # ---- one iteration -------------------------------------------------
 
@@ -46,14 +47,14 @@ class Engine:
         if Path(self.cfg.kill_file).exists():
             pos = self.state.position
             log.warning("kill file %s found; stopping. Open position is left as is%s", self.cfg.kill_file,
-                        " (its exchange stop-loss stays active)" if pos and pos.stop_order_id
+                        " (its exchange orders stay active)" if pos and pos.stop_order_id
                         else "" if not pos else " and its stop-loss is NOT watched")
             return False
         if self.state.halted:
             log.error("bot is halted: %s. Run `python -m bot resume` after reviewing.", self.state.halt_reason)
             return False
 
-        self._sync_exchange_stop()
+        self._sync_exchange_orders()
 
         now = self.clock()
         now_ms = int(now.timestamp() * 1000)
@@ -125,17 +126,12 @@ class Engine:
         self._protect(price)
 
     def _exit(self, price: float, reason: str) -> None:
-        pos = self.state.position
-        if pos.stop_order_id:
-            # Cancel first: the stop order locks the coins, and it may have filled already.
-            status, fill = self.broker.cancel_stop(pos.stop_order_id)
-            pos.stop_order_id = None
-            if fill:
-                self._record_exit(fill, "stop-loss (exchange)", closes=status == "closed")
-            self.store.save(self.state)
-            pos = self.state.position
-            if not pos:
+        if self._exchange_orders(self.state.position):
+            # Cancel first: the orders lock the coins, and one may have filled already.
+            self._close_exchange_orders()
+            if not self.state.position:
                 return
+        pos = self.state.position
         fill = self.broker.sell(pos.qty, price)
         if not fill:
             log.error("could not close position (%s); will retry next check", reason)
@@ -162,33 +158,60 @@ class Engine:
                  "" if self.state.position is None else f"; {pos.qty:.8f} still held")
         self.store.save(self.state)
 
-    # ---- exchange-side stop-loss ---------------------------------------
+    # ---- exchange-side stop-loss / take-profit -------------------------
 
-    def _sync_exchange_stop(self) -> None:
-        """Pick up a stop-loss that filled on the exchange (also while the bot was offline)."""
+    @staticmethod
+    def _exchange_orders(pos) -> list[tuple[str, str]]:
+        """(order id, exit reason) for each sell order protecting the position on the exchange."""
+        if not pos:
+            return []
+        legs = ((pos.stop_order_id, "stop-loss (exchange)"), (pos.tp_order_id, "take-profit (exchange)"))
+        return [(oid, reason) for oid, reason in legs if oid]
+
+    def _close_exchange_orders(self) -> None:
+        """Cancel the position's exchange orders and book whatever they already sold."""
         pos = self.state.position
-        if not pos or not pos.stop_order_id or not getattr(self.broker, "supports_stop_orders", False):
-            return
-        status, fill = self.broker.stop_order_status(pos.stop_order_id)
-        if status == "open":
-            return
-        pos.stop_order_id = None
-        if fill:
-            self._record_exit(fill, "stop-loss (exchange)", closes=status == "closed")
-        if self.state.position:
-            log.warning("exchange stop-loss order ended as %s; placing a new one", status)
+        results = [(reason, *self.broker.cancel_order(oid)) for oid, reason in self._exchange_orders(pos)]
+        pos.stop_order_id = pos.tp_order_id = None
+        for reason, status, fill in results:
+            if fill and self.state.position:
+                self._record_exit(fill, reason, closes=status == "closed")
         self.store.save(self.state)
 
+    def _sync_exchange_orders(self) -> None:
+        """Pick up a stop-loss or take-profit that filled on the exchange (also while the bot was offline)."""
+        orders = self._exchange_orders(self.state.position)
+        if not orders or not getattr(self.broker, "supports_stop_orders", False):
+            return
+        statuses = [self.broker.order_status(oid)[0] for oid, _ in orders]
+        if all(status == "open" for status in statuses):
+            return
+        # One leg ended (on an OCO the exchange cancels the other): cancel what's left, book the fills.
+        self._close_exchange_orders()
+        if self.state.position:
+            log.warning("exchange order ended (%s) with the position still open; placing new ones",
+                        ", ".join(statuses))
+
     def _protect(self, price: float) -> None:
-        """Make sure an open position has a stop-loss order resting on the exchange."""
+        """Make sure an open position has its stop-loss (and, with OCO, take-profit) on the exchange."""
         pos = self.state.position
-        if not pos or pos.stop_order_id or not self.exchange_stops:
+        if not pos or self._exchange_orders(pos) or not self.exchange_stops:
             return
         if price <= pos.stop_price:
             return  # already through the stop: the bot's own check sells instead
+        use_oco = bool(self.exchange_take_profits and pos.take_profit_price and price < pos.take_profit_price)
         try:
-            order_id = self.broker.place_stop(pos.qty, pos.stop_price)
+            if use_oco:
+                ids = self.broker.place_oco(pos.qty, pos.stop_price, pos.take_profit_price)
+            else:
+                stop_id = self.broker.place_stop(pos.qty, pos.stop_price)
+                ids = (stop_id, None) if stop_id else None
         except ccxt.NotSupported as e:
+            if use_oco:
+                log.error("%s: no OCO orders (%s); placing the stop-loss alone, the bot watches take-profit",
+                          self.cfg.exchange, e)
+                self.exchange_take_profits = False
+                return self._protect(price)
             log.error("%s does not support stop-loss orders (%s); the bot will watch the stop itself",
                       self.cfg.exchange, e)
             self.exchange_stops = False
@@ -196,12 +219,13 @@ class Engine:
         except ccxt.AuthenticationError:
             raise
         except Exception as e:
-            log.error("could not place exchange stop-loss (%s); retrying next check, "
+            log.error("could not place exchange orders (%s); retrying next check, "
                       "the bot is watching the stop meanwhile", e)
             return
-        if order_id:
-            pos.stop_order_id = order_id
-            log.info("exchange stop-loss placed: order %s, trigger %.2f", order_id, pos.stop_price)
+        if ids:
+            pos.stop_order_id, pos.tp_order_id = ids
+            log.info("exchange stop-loss placed: order %s, trigger %.2f%s", ids[0], pos.stop_price,
+                     f"; take-profit order {ids[1]} at {pos.take_profit_price:.2f} (OCO)" if ids[1] else "")
             self.store.save(self.state)
 
     # ---- forever loop --------------------------------------------------

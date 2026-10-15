@@ -17,6 +17,7 @@ class Position:
     take_profit_price: float | None
     opened_at: str
     stop_order_id: str | None = None  # stop-loss order resting on the exchange (testnet/live)
+    tp_order_id: str | None = None    # take-profit leg of an OCO on the exchange
 
 
 @dataclass

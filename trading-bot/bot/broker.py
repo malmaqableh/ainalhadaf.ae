@@ -83,6 +83,8 @@ class LiveBroker(ExchangeBroker):
         self.market = exchange.market(symbol)
         self.base = self.market["base"]
         self.quote = self.market["quote"]
+        # OCO uses Binance's own endpoint; ccxt has no unified OCO for spot.
+        self.supports_oco = getattr(exchange, "id", "") == "binance" and self.market.get("spot", False)
 
     def _balances(self) -> dict:
         return self.exchange.fetch_balance()
@@ -148,17 +150,17 @@ class LiveBroker(ExchangeBroker):
         order = self.exchange.create_order(self.symbol, "market", "sell", amount)
         return self._to_fill("sell", self._settle(order), ref_price)
 
-    # ---- exchange-side stop-loss ---------------------------------------
+    # ---- exchange-side stop-loss / take-profit -------------------------
     # Order status helpers return (status, fill): status is "open", "closed" (fully
     # filled) or "canceled"; fill covers whatever part of the order executed.
+
+    def _limit_below(self, stop_price: float) -> float:
+        return float(self.exchange.price_to_precision(self.symbol, stop_price * (1 - self.stop_limit_offset_pct)))
 
     def place_stop(self, qty: float, stop_price: float) -> str | None:
         """Rest a sell stop-loss order on the exchange; returns its order id."""
         trigger = float(self.exchange.price_to_precision(self.symbol, stop_price))
-        limit = None
-        if self.stop_order_type == "limit":
-            limit = float(self.exchange.price_to_precision(
-                self.symbol, stop_price * (1 - self.stop_limit_offset_pct)))
+        limit = self._limit_below(stop_price) if self.stop_order_type == "limit" else None
         free_base = float(self._balances().get("free", {}).get(self.base) or 0)
         amount = self._tradeable_amount(min(qty, free_base), limit or trigger)
         if amount is None:
@@ -167,11 +169,44 @@ class LiveBroker(ExchangeBroker):
             self.symbol, self.stop_order_type, "sell", amount, limit, trigger)
         return str(order["id"])
 
-    def stop_order_status(self, order_id: str) -> tuple[str, Fill | None]:
+    def place_oco(self, qty: float, stop_price: float, tp_price: float) -> tuple[str, str] | None:
+        """Binance spot OCO sell: a take-profit (LIMIT_MAKER) above the price and a stop-loss
+        below it. When one fills, Binance cancels the other. Returns (stop id, take-profit id)."""
+        if not self.supports_oco:
+            raise ccxt.NotSupported(f"OCO orders are only implemented for Binance spot, not {self.exchange.id}")
+        free_base = float(self._balances().get("free", {}).get(self.base) or 0)
+        amount = self._tradeable_amount(min(qty, free_base), stop_price)
+        if amount is None:
+            return None
+        request = {
+            "symbol": self.market["id"],
+            "side": "SELL",
+            "quantity": self.exchange.amount_to_precision(self.symbol, amount),
+            "aboveType": "LIMIT_MAKER",
+            "abovePrice": self.exchange.price_to_precision(self.symbol, tp_price),
+            "belowStopPrice": self.exchange.price_to_precision(self.symbol, stop_price),
+        }
+        if self.stop_order_type == "limit":
+            request.update(belowType="STOP_LOSS_LIMIT", belowTimeInForce="GTC",
+                           belowPrice=self.exchange.price_to_precision(self.symbol, self._limit_below(stop_price)))
+        else:
+            request["belowType"] = "STOP_LOSS"
+        response = self.exchange.private_post_orderlist_oco(request)
+        ids = {r.get("type"): str(r.get("orderId")) for r in response.get("orderReports") or []}
+        stop_id = ids.get("STOP_LOSS_LIMIT") or ids.get("STOP_LOSS")
+        tp_id = ids.get("LIMIT_MAKER")
+        if not stop_id or not tp_id:
+            # Don't leave orders on the exchange that the bot can't track.
+            for order in response.get("orders") or []:
+                self.cancel_order(str(order.get("orderId")))
+            raise RuntimeError(f"OCO response not understood, orders cancelled: {response}")
+        return stop_id, tp_id
+
+    def order_status(self, order_id: str) -> tuple[str, Fill | None]:
         try:
             order = self.exchange.fetch_order(order_id, self.symbol)
         except ccxt.OrderNotFound:
-            log.warning("stop order %s not found on the exchange", order_id)
+            log.warning("order %s not found on the exchange", order_id)
             return "canceled", None
         status = order.get("status")
         if status == "open":
@@ -181,14 +216,17 @@ class LiveBroker(ExchangeBroker):
             fill = self._to_fill("sell", order, float(order.get("price") or 0))
         return ("closed" if status == "closed" else "canceled"), fill
 
-    def cancel_stop(self, order_id: str) -> tuple[str, Fill | None]:
+    def cancel_order(self, order_id: str) -> tuple[str, Fill | None]:
         try:
             self.exchange.cancel_order(order_id, self.symbol)
-        except ccxt.OrderNotFound:
-            pass  # already filled or removed; the status below says which
-        status, fill = self.stop_order_status(order_id)
+        except ccxt.AuthenticationError:
+            raise
+        except ccxt.ExchangeError as e:
+            # Already filled, or cancelled with the other leg of its OCO; the status below says which.
+            log.info("cancel of order %s refused (%s); checking its status", order_id, e)
+        status, fill = self.order_status(order_id)
         if status == "open":
-            raise RuntimeError(f"stop order {order_id} is still open after cancelling")
+            raise RuntimeError(f"order {order_id} is still open after cancelling")
         return status, fill
 
 

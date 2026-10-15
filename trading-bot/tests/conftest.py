@@ -38,15 +38,19 @@ class FakeExchange:
 
 
 class FakeLiveExchange(FakeExchange):
-    """An authenticated exchange: real-looking balances, market orders and stop orders.
-    Open stop orders lock their coins, like on a real exchange."""
+    """An authenticated exchange: balances, market orders, stop orders and Binance-style OCO.
+    Open orders lock their coins (once per OCO, like Binance); filling one OCO leg expires
+    the other, and cancelling one leg cancels both."""
 
-    def __init__(self, candles, price=None, quote=1000.0):
+    def __init__(self, candles, price=None, quote=1000.0, exchange_id="test"):
         super().__init__(candles, price)
+        self.id = exchange_id
         self.balance = {"USDT": quote, "BTC": 0.0}
         self.orders = {}
         self.calls = []
         self.stop_error = None
+        self.oco_error = None
+        self.oco_response_override = None
         self._next_id = 0
 
     def _id(self):
@@ -57,19 +61,22 @@ class FakeLiveExchange(FakeExchange):
         return {}
 
     def market(self, symbol):
-        return {"base": "BTC", "quote": "USDT",
+        return {"id": "BTCUSDT", "base": "BTC", "quote": "USDT", "spot": True,
                 "limits": {"amount": {"min": 0.0001}, "cost": {"min": 5}}}
 
     def amount_to_precision(self, symbol, amount):
-        return f"{int(amount * 1e6) / 1e6:.6f}"
+        return f"{int(float(amount) * 1e6) / 1e6:.6f}"
 
     def price_to_precision(self, symbol, price):
-        return f"{price:.2f}"
+        return f"{float(price):.2f}"
 
     def fetch_balance(self):
-        locked = sum(o["amount"] - o["filled"] for o in self.orders.values() if o["status"] == "open")
-        return {"free": {"USDT": self.balance["USDT"], "BTC": self.balance["BTC"] - locked},
-                "total": dict(self.balance)}
+        locked = {}
+        for o in self.orders.values():
+            if o["status"] == "open":
+                locked[o.get("list") or o["id"]] = o["amount"] - o["filled"]
+        free_btc = self.balance["BTC"] - sum(locked.values())
+        return {"free": {"USDT": self.balance["USDT"], "BTC": free_btc}, "total": dict(self.balance)}
 
     def create_order(self, symbol, type, side, amount, price=None, params=None):
         self.calls.append(("market", side, amount))
@@ -80,25 +87,51 @@ class FakeLiveExchange(FakeExchange):
         self.balance["USDT"] -= sign * amount * self.price
         return {"id": self._id(), "status": "closed", "filled": amount, "average": self.price}
 
+    def _new_order(self, type, amount, price, trigger, list_id=None):
+        oid = self._id()
+        self.orders[oid] = {"id": oid, "type": type, "amount": amount, "price": price, "trigger": trigger,
+                            "status": "open", "filled": 0.0, "average": None, "list": list_id}
+        return oid
+
     def create_stop_loss_order(self, symbol, type, side, amount, price=None, stopLossPrice=None, params=None):
         if self.stop_error:
             raise self.stop_error
-        oid = self._id()
-        self.orders[oid] = {"id": oid, "type": type, "amount": amount, "price": price,
-                            "trigger": stopLossPrice, "status": "open", "filled": 0.0, "average": None}
+        oid = self._new_order(type, amount, price, stopLossPrice)
         self.calls.append(("stop", type, amount, price, stopLossPrice))
         return dict(self.orders[oid])
 
-    def fill_stop(self, oid, qty=None):
-        """Simulate the exchange executing (part of) a stop order."""
+    def private_post_orderlist_oco(self, request):
+        if self.oco_error:
+            raise self.oco_error
+        self.calls.append(("oco", dict(request)))
+        amount = float(request["quantity"])
+        list_id = "L" + self._id()
+        below_price = float(request["belowPrice"]) if "belowPrice" in request else None
+        stop_id = self._new_order(request["belowType"], amount, below_price,
+                                  float(request["belowStopPrice"]), list_id)
+        tp_id = self._new_order("LIMIT_MAKER", amount, float(request["abovePrice"]), None, list_id)
+        response = {"orderListId": list_id, "contingencyType": "OCO",
+                    "orders": [{"orderId": int(stop_id)}, {"orderId": int(tp_id)}],
+                    "orderReports": [{"orderId": int(stop_id), "type": request["belowType"]},
+                                     {"orderId": int(tp_id), "type": "LIMIT_MAKER"}]}
+        return self.oco_response_override(response) if self.oco_response_override else response
+
+    def fill_order(self, oid, qty=None):
+        """Simulate the exchange executing (part of) an order."""
         o = self.orders[oid]
         qty = qty or o["amount"]
         o["filled"] = qty
         o["average"] = o["price"] or o["trigger"]
         if qty >= o["amount"]:
             o["status"] = "closed"
+        if o["list"]:
+            for other in self.orders.values():
+                if other["list"] == o["list"] and other is not o and other["status"] == "open":
+                    other["status"] = "expired"
         self.balance["BTC"] -= qty
         self.balance["USDT"] += qty * o["average"]
+
+    fill_stop = fill_order
 
     def fetch_order(self, oid, symbol):
         if oid not in self.orders:
@@ -109,5 +142,7 @@ class FakeLiveExchange(FakeExchange):
         o = self.orders.get(oid)
         if not o or o["status"] != "open":
             raise ccxt.OrderNotFound(oid)
-        o["status"] = "canceled"
+        for other in self.orders.values():
+            if other is o or (o["list"] and other["list"] == o["list"]):
+                other["status"] = "canceled"
         self.calls.append(("cancel", oid))

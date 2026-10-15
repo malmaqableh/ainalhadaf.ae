@@ -34,6 +34,7 @@ class RiskConfig:
     exchange_stop_loss: bool = True   # testnet/live: keep a real stop order on the exchange
     stop_order_type: str = "limit"    # "limit" (needed on Binance spot) or "market"
     stop_limit_offset_pct: float = 0.01  # stop-limit: limit price this far below the trigger
+    exchange_take_profit: bool = True # Binance spot: stop-loss + take-profit as one OCO order
 
 
 @dataclass

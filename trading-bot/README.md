@@ -5,8 +5,8 @@ An autonomous crypto trading bot. Once started, it runs on its own, 24/7:
 1. Every `poll_seconds` it checks the price.
 2. When a candle closes, it asks the strategy: **buy**, **sell**, or **hold**.
 3. It sizes the trade from your risk settings and places the order.
-4. It protects every position with a stop-loss. In testnet/live mode this is a real
-   order resting on the exchange, so it works even when the bot is offline.
+4. It protects every position with a stop-loss and take-profit. In testnet/live mode
+   these are real orders resting on the exchange, so they work even when the bot is offline.
 5. It enforces a daily loss limit and a max-drawdown kill switch.
 6. It saves its state to disk, so it picks up where it left off after a restart.
 
@@ -89,7 +89,7 @@ The bot refuses to start in live mode without `BOT_CONFIRM_LIVE=YES`.
 
 Logs: `logs/bot.log`. State: `state/bot_state.json`.
 
-## Exchange-side stop-loss (testnet/live)
+## Exchange-side stop-loss and take-profit (testnet/live)
 
 Right after each buy, the bot places a **stop-loss sell order on the exchange**
 (`risk.exchange_stop_loss: true`). The exchange then protects the position even if
@@ -111,8 +111,23 @@ the bot, the server or the internet goes down.
 - **If the exchange doesn't support stop-loss orders,** the bot logs an error and falls
   back to watching the stop itself.
 
-Take-profit is still watched by the bot, not placed on the exchange. Missing it while
-offline means a missed gain, not a bigger loss.
+**Take-profit on the exchange (Binance spot).** On spot, the stop-loss and the take-profit
+both sell the same coins, so they can't be two separate orders: the first one locks the
+coins. With `risk.exchange_take_profit: true` the bot places them together as one
+**OCO order** ("one cancels the other"):
+
+- a `LIMIT_MAKER` sell at the take-profit price (above the market), and
+- the stop-loss (`STOP_LOSS_LIMIT`, or `STOP_LOSS` with `stop_order_type: market`) below it.
+
+When one leg fills, Binance cancels the other. Cancelling one leg cancels both. If the
+take-profit fills only partly, the bot cancels what's left and places a new OCO for the
+remaining coins. If Binance's reply can't be read, the bot cancels those orders rather
+than leave orders it can't track.
+
+OCO uses Binance's own `orderList/oco` endpoint (ccxt has no standard OCO call for spot),
+so it only works on **Binance**. On other exchanges, only the stop-loss goes on the
+exchange and the bot watches the take-profit itself. Missing a take-profit while offline
+means a missed gain, not a bigger loss.
 
 ## Running it 24/7
 
@@ -139,12 +154,12 @@ Then: `sudo systemctl enable --now trading-bot` and `journalctl -u trading-bot -
 
 ## Known limitations
 
-- Exchange-side stop orders were built against ccxt's unified API and Binance's
-  order rules, and are tested against a simulated exchange only. Other exchanges
-  (Bybit, OKX…) may handle trigger orders differently. Test on **testnet** first.
+- Exchange-side orders were built from ccxt's source and Binance's spot API docs,
+  and are tested against a simulated exchange only. Other exchanges (Bybit, OKX…) may
+  handle trigger orders differently. Test on **testnet** first.
 - In paper mode the stop-loss is watched by the bot (there is no exchange order).
-- Fees on stop-loss fills may not be reported by the exchange's order data, so P&L
-  for those trades can leave out the fee.
+- Fees on exchange stop-loss/take-profit fills may not be reported by the exchange's
+  order data, so P&L for those trades can leave out the fee.
 - Spot, long-only, one symbol at a time. No leverage or shorting.
 - Fees paid in a third currency (for example BNB) aren't counted in P&L.
 - Backtests use candle data, so the exact order of prices inside a candle is unknown.
