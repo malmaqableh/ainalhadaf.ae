@@ -1,0 +1,27 @@
+# docker compose up -d --build        (logs: docker compose logs -f bot)
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+  dashboard:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "-m", "streamlit", "run", "newsbot/monitoring/dashboard.py",
+              "--server.port", "8501", "--server.address", "0.0.0.0",
+              "--server.headless", "true", "--browser.gatherUsageStats", "false"]
+    healthcheck:
+      disable: true
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    # Bound to the server's localhost only: the dashboard has no login.
+    # Reach it with an SSH tunnel:  ssh -L 8501:localhost:8501 you@server
+    ports:
+      - "127.0.0.1:8501:8501"

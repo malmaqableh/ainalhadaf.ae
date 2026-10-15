@@ -1,0 +1,41 @@
+# Copy to config.yaml and edit.  python -m bot --config config.yaml run
+
+# paper   = real prices, simulated money (no API keys needed)   <- start here
+# testnet = exchange's test network with fake funds (testnet API keys)
+# live    = REAL MONEY. Also requires env BOT_CONFIRM_LIVE=YES
+mode: paper
+
+exchange: binance        # any ccxt exchange id, e.g. binance, bybit, okx, kraken
+symbol: BTC/USDT
+timeframe: 1h            # candle size the strategy works on
+poll_seconds: 60         # how often the bot checks price, stop-loss and take-profit
+
+strategy:
+  name: ma_crossover
+  fast: 20
+  slow: 50
+
+risk:
+  starting_cash: 1000        # paper mode only (in quote currency, e.g. USDT)
+  risk_per_trade: 0.01       # lose at most ~1% of equity if the stop-loss hits
+  max_position_pct: 0.25     # never put more than 25% of equity in one position
+  stop_loss_pct: 0.03        # exit if price falls 3% below entry
+  take_profit_pct: 0.06      # exit if price rises 6% above entry (0 = off)
+  max_daily_loss_pct: 0.03   # down 3% today -> no new trades until tomorrow (UTC)
+  max_drawdown_pct: 0.15     # down 15% from peak -> sell everything and HALT
+  # testnet/live: keep a real stop-loss order on the exchange, so the position
+  # stays protected even if the bot or server goes down.
+  exchange_stop_loss: true
+  stop_order_type: limit     # limit = stop-limit (Binance spot needs this) | market
+  stop_limit_offset_pct: 0.01  # stop-limit sells no lower than 1% below the trigger
+  # Binance spot: also put the take-profit on the exchange, combined with the
+  # stop-loss in one OCO order (when one fills, the exchange cancels the other).
+  exchange_take_profit: true
+
+costs:
+  fee_rate: 0.001            # 0.1% per trade; check your exchange's fee tier
+  slippage: 0.0005           # assumed price slippage on market orders
+
+state_file: state/bot_state.json
+log_file: logs/bot.log
+kill_file: STOP              # create this file to stop the bot
